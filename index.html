@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js 晶体爱心 (高清版)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Arial', sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        /* UI 调整 */
+        #ui-layer {
+            position: absolute; top: 20px; right: 20px; z-index: 10;
+            background: rgba(15, 15, 15, 0.9);
+            backdrop-filter: blur(8px);
+            padding: 16px; border-radius: 12px;
+            border: 1px solid rgba(100, 100, 100, 0.3);
+            color: white; width: 260px;
+        }
+        
+        h2 { margin: 0 0 12px 0; font-size: 15px; color: #ff3366; border-bottom: 1px solid #333; padding-bottom: 8px;}
+        
+        button {
+            width: 100%; padding: 12px; margin-bottom: 8px;
+            background: #222; border: 1px solid #444;
+            border-radius: 6px; color: #eee; cursor: pointer;
+            font-size: 14px; font-weight: bold; transition: all 0.2s;
+        }
+        button:hover { background: #444; border-color: #ff3366; color: #fff; }
+        button.active { background: #ff3366; color: #fff; border-color: #ff99aa; }
+
+        #loader {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; display: flex; justify-content: center; align-items: center;
+            z-index: 999; flex-direction: column; color: #ff3366;
+            transition: opacity 0.5s ease;
+            pointer-events: none;
+        }
+        #video-input { position: absolute; opacity: 0; pointer-events: none; }
+    </style>
+    
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.154.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.154.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.18.0/dist/lil-gui.umd.min.js"></script>
+</head>
+<body>
+
+    <div id="loader">
+        <div>💎 正在打磨宝石...</div>
+    </div>
+
+    <div id="ui-layer">
+        <h2>交互控制台</h2>
+        <div style="margin-bottom:12px; font-size:12px; color:#aaa;">
+            玩法: <span style="color:#ff6688;">张手=散开</span> | <span style="color:#ff6688;">握拳=聚拢</span>
+        </div>
+        <div style="margin-bottom:12px; font-size:12px; color:#888;">
+            状态: <span id="status-text" style="color:#ffff00; font-weight:bold;">正在连接摄像头...</span>
+        </div>
+        
+        <button id="btn-heart" class="active">❤️ 晶体爱心</button>
+        <button id="btn-text">🅰️ 名字/文字</button>
+        <button id="btn-sphere">🔮 晶体星球</button>
+        
+        <div id="gui-container"></div>
+    </div>
+
+    <video id="video-input" playsinline></video>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        let scene, camera, renderer, particles, material, geometry;
+        let isPinching = false;
+        const statusText = document.getElementById('status-text');
+        const loader = document.getElementById('loader');
+        
+        // --- 核心参数 ---
+        const params = {
+            particleSize: 3.0,      // 稍微调小一点，保证精致感
+            rotationSpeed: 0.1,     // 旋转速度适中
+            colorCore: '#ff0044',   // 核心深红
+            colorEdge: '#ffccdd',   // 边缘淡粉
+            opacity: 0.9,           // 【重要】因为改了混合模式，透明度要高一点才看见
+            pinchThreshold: 0.08,   
+            currentShape: 'heart',  
+            currentText: 'LOVE',    
+            scatterRange: 45.0      
+        };
+
+        // --- Shader 逻辑 ---
+        const vertexShader = `
+            uniform float uTime;
+            uniform float uPinchMix; 
+            uniform float uSize;
+            uniform float uRotSpeed; 
+            uniform float uScatterRange;
+            
+            attribute vec3 initialPosition; 
+            attribute vec3 color;           
+            attribute float aRandom;        
+            
+            varying vec3 vColor;
+
+            void main() {
+                // 1. 强制旋转 (无论握拳与否，基础形状都在转)
+                float angle = uTime * uRotSpeed;
+                float s = sin(angle);
+                float c = cos(angle);
+                mat3 rotMat = mat3(c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c);
+                
+                // 让目标形状时刻保持旋转
+                vec3 posShape = rotMat * initialPosition;
+                
+                // 2. 散开位置 (漂浮感)
+                // 散开时也稍微带点旋转，但不那么规则
+                vec3 noise = vec3(
+                    sin(uTime * 0.3 + aRandom * 20.0),
+                    cos(uTime * 0.2 + aRandom * 30.0),
+                    sin(uTime * 0.4 + aRandom * 40.0)
+                );
+                
+                // 散开时，位置是基于旋转后的位置炸开的，这样动感更强
+                vec3 posScatter = (posShape * 1.5) + (noise * uScatterRange);
+
+                // 3. 混合插值
+                float t = smoothstep(0.0, 1.0, uPinchMix);
+                vec3 finalPos = mix(posScatter, posShape, t);
+
+                vec4 mvPosition = modelViewMatrix * vec4(finalPos, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+                
+                // 4. 大小计算 (确保远近有别，但不过大)
+                float dist = length(mvPosition.xyz);
+                gl_PointSize = uSize * (350.0 / dist);
+                gl_PointSize = clamp(gl_PointSize, 1.0, 10.0); // 限制最大最小值，防止糊脸
+                
+                vColor = color;
+            }
+        `;
+
+        const fragmentShader = `
+            uniform float uOpacity;
+            varying vec3 vColor;
+
+            void main() {
+                // 绘制圆形粒子
+                vec2 coord = gl_PointCoord - vec2(0.5);
+                float dist = length(coord);
+                if(dist > 0.5) discard;
+                
+                // 边缘稍微硬一点，增加"实体感"
+                float alphaShape = 1.0 - smoothstep(0.4, 0.5, dist);
+                
+                // 直接输出颜色，不再做强光叠加
+                gl_FragColor = vec4(vColor, alphaShape * uOpacity);
+            }
+        `;
+
+        function initThree() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x050505);
+            scene.fog = new THREE.FogExp2(0x050505, 0.002);
+
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 0, 35);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            const controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.enablePan = false;
+            
+            initGUI();
+            refreshShape();
+            
+            // 关闭Loading
+            loader.style.opacity = '0';
+            setTimeout(() => loader.style.display = 'none', 500);
+
+            window.addEventListener('resize', onWindowResize);
+            animate();
+            initAI();
+        }
+
+        async function initAI() {
+            try {
+                const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+                hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+                hands.onResults(onResults);
+
+                const video = document.getElementById('video-input');
+                const cam = new Camera(video, {
+                    onFrame: async () => await hands.send({image: video}),
+                    width: 640, height: 480
+                });
+                await cam.start();
+                statusText.innerText = "👀 等待手势...";
+                statusText.style.color = "#888";
+            } catch (error) {
+                console.error(error);
+                statusText.innerText = "❌ 摄像头失败 (仅展示模式)";
+                statusText.style.color = "#ff0000";
+            }
+        }
+
+        function refreshShape() {
+            if (params.currentShape === 'heart') createHeartParticles();
+            else if (params.currentShape === 'text') createText(params.currentText);
+            else if (params.currentShape === 'sphere') createSphere();
+        }
+
+        // --- 爱心生成逻辑 ---
+        function createHeartParticles() {
+            const count = 12000; // 数量适中，颗颗分明
+            const positions = [];
+            const colors = [];
+            
+            const cCore = new THREE.Color(params.colorCore);
+            const cEdge = new THREE.Color(params.colorEdge);
+
+            for(let i = 0; i < count; i++) {
+                const t = Math.random() * Math.PI * 2;
+                let x = 16 * Math.pow(Math.sin(t), 3);
+                let y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+                
+                const r = Math.sqrt(Math.random()); 
+                x *= r; y *= r;
+                
+                // 【关键】增加Z轴厚度，把粒子分开，避免重叠
+                const z = (Math.random() - 0.5) * 8.0 * r; 
+
+                const scale = 0.4;
+                positions.push(x * scale, y * scale, z * scale);
+                
+                // 颜色
+                const c = new THREE.Color().copy(cCore).lerp(cEdge, Math.pow(r, 1.5));
+                colors.push(c.r, c.g, c.b);
+            }
+            updateGeometry(positions, colors);
+        }
+
+        function createText(text) {
+            const cvs = document.createElement('canvas');
+            const ctx = cvs.getContext('2d');
+            cvs.width=400; cvs.height=200;
+            ctx.fillStyle='#000'; ctx.fillRect(0,0,400,200);
+            ctx.fillStyle='#fff'; ctx.font='bold 120px Arial'; 
+            ctx.textAlign='center'; ctx.textBaseline='middle';
+            ctx.fillText(text, 200, 100);
+            
+            const data = ctx.getImageData(0,0,400,200).data;
+            const pos=[], col=[];
+            const cCore = new THREE.Color(params.colorCore);
+            const cEdge = new THREE.Color(params.colorEdge);
+
+            for(let y=0; y<200; y+=3) { 
+                for(let x=0; x<400; x+=3) {
+                    if(data[(y*400+x)*4] > 128) {
+                        pos.push((x-200)*0.12, -(y-100)*0.12, (Math.random()-0.5)*3);
+                        let c = new THREE.Color().copy(cCore).lerp(cEdge, Math.random());
+                        col.push(c.r, c.g, c.b);
+                    }
+                }
+            }
+            updateGeometry(pos, col);
+        }
+
+        function createSphere() {
+            const count=10000;
+            const pos=[], col=[];
+            const cEdge = new THREE.Color(params.colorEdge);
+            const cCore = new THREE.Color(params.colorCore);
+            
+            for(let i=0; i<count; i++){
+                const r = 9;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                const radiusVar = r * (0.8 + Math.random() * 0.4);
+                
+                pos.push(radiusVar * Math.sin(phi) * Math.cos(theta), radiusVar * Math.sin(phi) * Math.sin(theta), radiusVar * Math.cos(phi));
+                let c = new THREE.Color().copy(cCore).lerp(cEdge, Math.random());
+                col.push(c.r, c.g, c.b);
+            }
+            updateGeometry(pos, col);
+        }
+
+        function updateGeometry(positions, colors) {
+            if(particles) scene.remove(particles);
+            geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('initialPosition', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            geometry.setAttribute('aRandom', new THREE.Float32BufferAttribute(new Float32Array(positions.length/3).map(Math.random), 1));
+            
+            material = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTime: { value: 0 },
+                    uPinchMix: { value: 0 },
+                    uSize: { value: params.particleSize },
+                    uRotSpeed: { value: params.rotationSpeed },
+                    uScatterRange: { value: params.scatterRange },
+                    uOpacity: { value: params.opacity }
+                },
+                vertexShader: vertexShader,
+                fragmentShader: fragmentShader,
+                transparent: true,
+                depthWrite: false,
+                // 【核心修改】：使用 NormalBlending 解决"一团白光"的问题
+                // 这会让粒子保持原本的颜色，而不会无限变亮
+                blending: THREE.NormalBlending 
+            });
+            
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+        }
+
+        function onResults(results) {
+            if(results.multiHandLandmarks && results.multiHandLandmarks.length>0) {
+                const lm = results.multiHandLandmarks[0];
+                const t = lm[4], i = lm[8];
+                const dist = Math.sqrt(Math.pow(t.x-i.x,2)+Math.pow(t.y-i.y,2));
+                
+                if(dist < params.pinchThreshold) {
+                    isPinching = true;
+                    statusText.innerText = "❤️ 握拳聚拢";
+                    statusText.style.color = "#ff3366";
+                } else {
+                    isPinching = false;
+                    statusText.innerText = "✨ 张手散开";
+                    statusText.style.color = "#ffffff";
+                }
+            } else {
+                isPinching = false; 
+                statusText.innerText = "👀 等待手势...";
+                statusText.style.color = "#888";
+            }
+        }
+
+        let currentMix = 0;
+        function animate() {
+            requestAnimationFrame(animate);
+            if(material) {
+                material.uniforms.uTime.value += 0.01;
+                const target = isPinching ? 1.0 : 0.0;
+                currentMix += (target - currentMix) * 0.1; 
+                material.uniforms.uPinchMix.value = currentMix;
+            }
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function initGUI() {
+            const gui = new lil.GUI({ container: document.getElementById('gui-container'), width: '100%' });
+            
+            gui.add(params, 'rotationSpeed', 0.0, 0.5).name('旋转速度').onChange(v => material.uniforms.uRotSpeed.value = v);
+            gui.add(params, 'particleSize', 1.0, 10.0).name('粒子大小').onChange(v => material.uniforms.uSize.value = v);
+            gui.add(params, 'opacity', 0.1, 1.0).name('粒子透明度').onChange(v => material.uniforms.uOpacity.value = v);
+
+            const fColor = gui.addFolder('颜色设置');
+            fColor.addColor(params, 'colorCore').name('核心颜色').onChange(refreshShape);
+            fColor.addColor(params, 'colorEdge').name('边缘颜色').onChange(refreshShape);
+            fColor.open();
+
+            const btns = {
+                heart: document.getElementById('btn-heart'),
+                text: document.getElementById('btn-text'),
+                sphere: document.getElementById('btn-sphere')
+            };
+
+            function updateBtn(key) {
+                params.currentShape = key;
+                Object.values(btns).forEach(b => b.classList.remove('active'));
+                btns[key].classList.add('active');
+                refreshShape();
+            }
+
+            btns.heart.onclick = () => updateBtn('heart');
+            btns.sphere.onclick = () => updateBtn('sphere');
+            btns.text.onclick = () => {
+                const t = prompt("输入文字", "LOVE");
+                if(t) { params.currentText = t; updateBtn('text'); }
+            };
+        }
+
+        initThree();
+
+    </script>
+</body>
+</html>
